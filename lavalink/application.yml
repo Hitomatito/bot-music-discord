@@ -1,0 +1,48 @@
+server:
+  port: 2333
+  address: 0.0.0.0
+
+lavalink:
+  server:
+    password: "${LAVALINK_PASSWORD}"
+    sources:
+      youtube: false
+      bandcamp: true
+      soundcloud: true
+      twitch: true
+      vimeo: true
+      http: true
+      local: false
+
+plugins:
+  youtube:
+    enabled: true
+    allowSearch: true
+
+metrics:
+  prometheus:
+    enabled: false
+    endpoint: /metrics
+
+sentry:
+  dsn: ""
+  environment: ""
+
+logging:
+  level:
+    root: INFO
+    lavalink: DEBUG
+    lavalink.server.io: DEBUG
+    lavalink.server.player: DEBUG
+    lavalink.server.player.AudioLoaderRestHandler: DEBUG
+    lavalink.server.io.SocketServer: DEBUG
+    lavalink.server.io.HandshakeInterceptorImpl: DEBUG
+    moe.kyokobot.koe: DEBUG
+    moe.kyokobot.koe.gateway: DEBUG
+    moe.kyokobot.koe.internal: DEBUG
+    moe.kyokobot.koe.internal.handler: DEBUG
+    moe.kyokobot.koe.internal.handler.HolepunchHandler: TRACE
+    moe.kyokobot.koe.internal.handler.DiscordUDPConnection: TRACE
+    moe.kyokobot.koe.gateway.AbstractMediaGatewayConnection: TRACE
+    moe.kyokobot.koe.internal.MediaConnectionImpl: DEBUG
+    dev.lavalink.youtube: DEBUG
