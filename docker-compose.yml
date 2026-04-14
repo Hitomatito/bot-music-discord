@@ -1,0 +1,29 @@
+services:
+  lavalink:
+    init: true
+    build:
+      context: .
+      dockerfile: Dockerfile.lavalink
+    environment:
+      LAVALINK_PASSWORD: ${LAVALINK_PASSWORD:?set LAVALINK_PASSWORD in .env}
+    ports:
+      - "${LAVALINK_HOST_PORT:-2333}:2333"
+    restart: unless-stopped
+    stop_grace_period: 30s
+
+  bot:
+    init: true
+    build:
+      context: .
+      dockerfile: Dockerfile.bot
+    environment:
+      BOT_TOKEN: ${BOT_TOKEN:?set BOT_TOKEN in .env}
+      LAVALINK_HOST: lavalink
+      LAVALINK_PORT: 2333
+      LAVALINK_PASSWORD: ${LAVALINK_PASSWORD:?set LAVALINK_PASSWORD in .env}
+      PYTHONUNBUFFERED: "1"
+    depends_on:
+      lavalink:
+        condition: service_healthy
+    restart: unless-stopped
+    stop_grace_period: 30s
