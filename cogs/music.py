@@ -1,4 +1,5 @@
 import asyncio
+from dataclasses import dataclass
 
 import discord
 from discord import app_commands
@@ -6,14 +7,142 @@ from discord.ext import commands
 import lavalink
 from lavalink.errors import ClientError
 
-from utils.embeds import BOT_ERROR, BOT_PRIMARY, BOT_SUCCESS, BOT_WARNING, build_base_embed, format_duration, progress_bar
+from utils.embeds import (
+    BOT_ERROR,
+    BOT_PRIMARY,
+    BOT_SUCCESS,
+    BOT_WARNING,
+    build_base_embed,
+    format_duration,
+    progress_bar,
+)
 from utils.lavalink_voice import LavalinkVoiceClient
 from utils.search import (
     _canonicalize_youtube_playlist_url,
     is_youtube_url,
     search_public_youtube_playlist,
+    search_youtube_candidates,
     search_youtube_best_match,
 )
+
+
+SEARCH_SUGGESTION_LIMIT = 10
+SEARCH_PREVIEW_LIMIT = 5
+
+
+@dataclass(slots=True)
+class SearchChoice:
+    title: str
+    url: str
+    author: str | None = None
+    duration: int | None = None
+    thumbnail: str | None = None
+
+
+class SearchSelect(discord.ui.Select):
+    def __init__(
+        self,
+        cog: "MusicCog",
+        interaction: discord.Interaction,
+        query: str,
+        choices: list[SearchChoice],
+        mode: str,
+    ):
+        self.cog = cog
+        self.interaction = interaction
+        self.query = query
+        self.mode = mode
+        self.requester_id = interaction.user.id if interaction.user else 0
+        self.choices_data = choices[:25]
+
+        options = []
+        for index, choice in enumerate(self.choices_data, 1):
+            label = choice.title[:100]
+            details = []
+            if choice.author:
+                details.append(choice.author)
+            if choice.duration:
+                details.append(format_duration(choice.duration))
+            description = (
+                " · ".join(details)[:100] if details else "Coincidencia sugerida"
+            )
+            options.append(
+                discord.SelectOption(
+                    label=label, description=description, value=str(index - 1)
+                )
+            )
+
+        super().__init__(
+            placeholder="Elige una coincidencia",
+            min_values=1,
+            max_values=1,
+            options=options,
+        )
+
+    async def callback(self, interaction: discord.Interaction):
+        if interaction.user.id != self.requester_id:
+            await interaction.response.send_message(
+                "Solo quien ejecutó el comando puede usar esta selección.",
+                ephemeral=True,
+            )
+            return
+
+        index = int(self.values[0])
+        selected = self.choices_data[index]
+        await interaction.response.defer()
+        await self.cog._queue_selected_track(self.interaction, selected, mode=self.mode)
+        await self.view.complete(
+            note=f"Seleccionado por {interaction.user.display_name}."
+        )
+
+
+class SearchSelectView(discord.ui.View):
+    def __init__(
+        self,
+        cog: "MusicCog",
+        interaction: discord.Interaction,
+        query: str,
+        choices: list[SearchChoice],
+        mode: str,
+    ):
+        super().__init__(timeout=60)
+        self.message: discord.Message | None = None
+        self.add_item(SearchSelect(cog, interaction, query, choices, mode))
+
+    async def complete(self, *, note: str | None = None):
+        for item in self.children:
+            item.disabled = True
+
+        if self.message is not None:
+            edit_kwargs = {"view": self}
+            if note is not None:
+                edit_kwargs["content"] = note
+            try:
+                await self.message.edit(**edit_kwargs)
+            except discord.HTTPException:
+                pass
+
+        self.stop()
+
+    async def on_timeout(self):
+        await self.complete(
+            note="⌛ La selección expiró. Ejecuta el comando otra vez si quieres otra búsqueda."
+        )
+
+
+async def song_query_autocomplete(interaction: discord.Interaction, current: str):
+    if not current or len(current.strip()) < 2:
+        return []
+
+    choices = await search_youtube_candidates(current, limit=SEARCH_SUGGESTION_LIMIT)
+    return [
+        app_commands.Choice(
+            name=(choice.get("title") or "Desconocido")[:100],
+            value=(choice.get("url") or "")[:100],
+        )
+        for choice in choices[:25]
+        if choice.get("url")
+    ]
 
 
 class MusicCog(commands.Cog):
@@ -37,16 +166,31 @@ class MusicCog(commands.Cog):
 
         return lavalink_client.player_manager.get(guild_id)
 
-    def _build_embed(self, interaction: discord.Interaction, title: str, description: str | None = None, *, color=BOT_PRIMARY):
+    def _build_embed(
+        self,
+        interaction: discord.Interaction,
+        title: str,
+        description: str | None = None,
+        *,
+        color=BOT_PRIMARY,
+    ):
         embed = build_base_embed(title=title, description=description, color=color)
 
         if interaction.guild and interaction.guild.icon:
-            embed.set_author(name=interaction.guild.name, icon_url=interaction.guild.icon.url)
+            embed.set_author(
+                name=interaction.guild.name, icon_url=interaction.guild.icon.url
+            )
 
-        requester_name = interaction.user.display_name if interaction.user else "Usuario"
-        requester_avatar = getattr(getattr(interaction.user, "display_avatar", None), "url", None)
+        requester_name = (
+            interaction.user.display_name if interaction.user else "Usuario"
+        )
+        requester_avatar = getattr(
+            getattr(interaction.user, "display_avatar", None), "url", None
+        )
         if requester_avatar:
-            embed.set_footer(text=f"Solicitado por {requester_name}", icon_url=requester_avatar)
+            embed.set_footer(
+                text=f"Solicitado por {requester_name}", icon_url=requester_avatar
+            )
         else:
             embed.set_footer(text=f"Solicitado por {requester_name}")
 
@@ -59,10 +203,214 @@ class MusicCog(commands.Cog):
             await interaction.response.send_message(embed=embed)
 
     async def _send_reply(self, interaction: discord.Interaction, content: str):
-        await self._send_embed(interaction, self._build_embed(interaction, "Actualización", content, color=BOT_PRIMARY))
+        await self._send_embed(
+            interaction,
+            self._build_embed(interaction, "Actualización", content, color=BOT_PRIMARY),
+        )
 
     async def _send_error(self, interaction: discord.Interaction, content: str):
-        await self._send_embed(interaction, self._build_embed(interaction, "No se pudo completar", content, color=BOT_ERROR))
+        await self._send_embed(
+            interaction,
+            self._build_embed(
+                interaction, "No se pudo completar", content, color=BOT_ERROR
+            ),
+        )
+
+    async def _send_search_choices(
+        self,
+        interaction: discord.Interaction,
+        *,
+        query: str,
+        choices: list[SearchChoice],
+        mode: str,
+    ):
+        if not choices:
+            return False
+
+        if len(choices) == 1:
+            await self._queue_selected_track(interaction, choices[0], mode=mode)
+            return True
+
+        embed = self._build_embed(
+            interaction,
+            "Selecciona una pista",
+            f"Encontré varias coincidencias para **{query}**. Elige una opción para reproducirla exactamente.",
+            color=BOT_PRIMARY,
+        )
+
+        if choices and choices[0].thumbnail:
+            embed.set_thumbnail(url=choices[0].thumbnail)
+
+        preview_lines = []
+        for index, choice in enumerate(choices[:SEARCH_PREVIEW_LIMIT], 1):
+            duration = (
+                format_duration(choice.duration) if choice.duration else "Desconocida"
+            )
+            author = choice.author or "Desconocido"
+            preview_lines.append(f"{index}. {choice.title} · {author} · {duration}")
+
+        if len(choices) > SEARCH_PREVIEW_LIMIT:
+            preview_lines.append(f"… y {len(choices) - SEARCH_PREVIEW_LIMIT} más")
+
+        embed.add_field(
+            name=f"Mejores coincidencias ({len(choices)})",
+            value="\n".join(preview_lines),
+            inline=False,
+        )
+        embed.set_footer(
+            text="Selecciona una opción o escribe más detalles para afinar la búsqueda."
+        )
+
+        view = SearchSelectView(self, interaction, query, choices[:25], mode)
+        if interaction.response.is_done():
+            view.message = await interaction.followup.send(embed=embed, view=view)
+        else:
+            await interaction.response.send_message(embed=embed, view=view)
+            view.message = await interaction.original_response()
+        return True
+
+    async def _queue_selected_track(
+        self, interaction: discord.Interaction, choice: SearchChoice, *, mode: str
+    ):
+        player, error_message = await self._ensure_player(interaction)
+        if player is None:
+            return await self._send_error(interaction, error_message)
+
+        print(
+            f"[{mode.upper()}] Selección manual: {choice.title} | {choice.author or 'desconocido'}"
+        )
+        try:
+            results = await player.node.get_tracks(choice.url)
+        except Exception as exc:
+            return await self._send_error(
+                interaction, f"No pude cargar la selección: {exc}"
+            )
+
+        if not results or not results.tracks:
+            return await self._send_error(
+                interaction, f"No se pudo cargar la selección: '{choice.title}'"
+            )
+
+        track = results.tracks[0]
+        track.requester = interaction.user.id
+        player.add(track)
+
+        started = False
+        if not player.is_playing:
+            await player.play()
+            started = True
+
+        description = f"**{track.title or choice.title}**"
+        if started:
+            await self._send_embed(
+                interaction,
+                self._build_embed(
+                    interaction, "Reproduciendo ahora", description, color=BOT_SUCCESS
+                ),
+            )
+        else:
+            title = (
+                "Añadida y en reproducción" if mode == "add" else "Añadida a la cola"
+            )
+            await self._send_embed(
+                interaction,
+                self._build_embed(interaction, title, description, color=BOT_PRIMARY),
+            )
+
+        return True
+
+    async def _build_song_choices(
+        self, query: str, limit: int = 5
+    ) -> list[SearchChoice]:
+        results = await search_youtube_candidates(query, limit=limit)
+        choices: list[SearchChoice] = []
+
+        for result in results:
+            choices.append(
+                SearchChoice(
+                    title=result.get("title") or "Desconocido",
+                    url=result.get("url") or "",
+                    author=result.get("uploader") or result.get("channel"),
+                    duration=result.get("duration"),
+                    thumbnail=result.get("thumbnail"),
+                )
+            )
+
+        return [choice for choice in choices if choice.url]
+
+    async def _handle_music_search(
+        self,
+        interaction: discord.Interaction,
+        query: str,
+        *,
+        mode: str,
+        log_prefix: str,
+    ):
+        if is_youtube_url(query):
+            player, display_title, started, error_message = await self._queue_query(
+                interaction, query, log_prefix=log_prefix
+            )
+            if player is None:
+                return await self._send_error(interaction, error_message)
+
+            description = f"**{display_title}**"
+            if started:
+                await self._send_embed(
+                    interaction,
+                    self._build_embed(
+                        interaction,
+                        "Reproduciendo ahora",
+                        description,
+                        color=BOT_SUCCESS,
+                    ),
+                )
+            else:
+                title = (
+                    "Añadida y en reproducción"
+                    if mode == "add"
+                    else "Añadida a la cola"
+                )
+                await self._send_embed(
+                    interaction,
+                    self._build_embed(
+                        interaction, title, description, color=BOT_PRIMARY
+                    ),
+                )
+            return
+
+        await interaction.response.defer()
+        candidates = await self._build_song_choices(
+            query, limit=SEARCH_SUGGESTION_LIMIT
+        )
+        if candidates:
+            handled = await self._send_search_choices(
+                interaction, query=query, choices=candidates, mode=mode
+            )
+            if handled:
+                return
+
+        player, display_title, started, error_message = await self._queue_query(
+            interaction, query, log_prefix=log_prefix
+        )
+        if player is None:
+            return await self._send_error(interaction, error_message)
+
+        description = f"**{display_title}**"
+        if started:
+            await self._send_embed(
+                interaction,
+                self._build_embed(
+                    interaction, "Reproduciendo ahora", description, color=BOT_SUCCESS
+                ),
+            )
+        else:
+            title = (
+                "Añadida y en reproducción" if mode == "add" else "Añadida a la cola"
+            )
+            await self._send_embed(
+                interaction,
+                self._build_embed(interaction, title, description, color=BOT_PRIMARY),
+            )
 
     def _require_voice_channel(self, interaction: discord.Interaction):
         if interaction.guild is None:
@@ -78,7 +426,10 @@ class MusicCog(commands.Cog):
             return None, "Este comando solo funciona en servidores."
 
         if not interaction.user.voice:
-            return None, "Debes estar en un canal de voz para controlar la reproduccion."
+            return (
+                None,
+                "Debes estar en un canal de voz para controlar la reproduccion.",
+            )
 
         player = self._get_player(interaction.guild.id)
         if player is None:
@@ -98,7 +449,10 @@ class MusicCog(commands.Cog):
             try:
                 raw_player = await player.node.get_player(player.guild_id)
             except Exception as exc:
-                print(f"[VOICE] estado remoto no disponible todavía: {type(exc).__name__}: {exc}", flush=True)
+                print(
+                    f"[VOICE] estado remoto no disponible todavía: {type(exc).__name__}: {exc}",
+                    flush=True,
+                )
                 await asyncio.sleep(0.5)
                 continue
 
@@ -136,7 +490,10 @@ class MusicCog(commands.Cog):
                 missing.append("CONNECT")
             if not perms.speak:
                 missing.append("SPEAK")
-            return None, f"No tengo permisos de voz suficientes en **{voice_channel.name}**: {', '.join(missing)}."
+            return (
+                None,
+                f"No tengo permisos de voz suficientes en **{voice_channel.name}**: {', '.join(missing)}.",
+            )
 
         voice_client = interaction.guild.voice_client
 
@@ -145,7 +502,10 @@ class MusicCog(commands.Cog):
                 await voice_channel.connect(cls=LavalinkVoiceClient, self_deaf=True)
             except ClientError as exc:
                 print(f"[VOICE] no se pudo crear el player: {exc}", flush=True)
-                return None, "Lavalink no tiene nodos disponibles ahora mismo. Espera unos segundos e inténtalo otra vez."
+                return (
+                    None,
+                    "Lavalink no tiene nodos disponibles ahora mismo. Espera unos segundos e inténtalo otra vez.",
+                )
         elif voice_client.channel.id != voice_channel.id:
             return None, "Debes estar en el mismo canal de voz que el bot."
 
@@ -155,7 +515,10 @@ class MusicCog(commands.Cog):
                 player = lavalink_client.player_manager.create(interaction.guild.id)
             except ClientError as exc:
                 print(f"[VOICE] no se pudo recuperar el player: {exc}", flush=True)
-                return None, "Lavalink no tiene nodos disponibles ahora mismo. Espera unos segundos e inténtalo otra vez."
+                return (
+                    None,
+                    "Lavalink no tiene nodos disponibles ahora mismo. Espera unos segundos e inténtalo otra vez.",
+                )
 
         for _ in range(20):
             if player.is_connected:
@@ -163,12 +526,19 @@ class MusicCog(commands.Cog):
             await asyncio.sleep(0.1)
 
         if not await self._wait_for_remote_voice(player, timeout=10.0):
-            print("[VOICE] Lavalink no confirmó la conexión de voz a tiempo", flush=True)
-            return None, "No pude confirmar la conexión de voz con Lavalink. Inténtalo otra vez en unos segundos."
+            print(
+                "[VOICE] Lavalink no confirmó la conexión de voz a tiempo", flush=True
+            )
+            return (
+                None,
+                "No pude confirmar la conexión de voz con Lavalink. Inténtalo otra vez en unos segundos.",
+            )
 
         return player, None
 
-    async def _queue_query(self, interaction: discord.Interaction, query: str, *, log_prefix: str):
+    async def _queue_query(
+        self, interaction: discord.Interaction, query: str, *, log_prefix: str
+    ):
         player, error_message = await self._ensure_player(interaction)
         if player is None:
             return None, None, False, error_message
@@ -180,8 +550,14 @@ class MusicCog(commands.Cog):
             search_result = await search_youtube_best_match(query, limit=12)
             if search_result:
                 normalized_query = search_result["url"]
-                uploader = search_result.get("uploader") or search_result.get("channel") or "desconocido"
-                print(f"[{log_prefix}] Mejor coincidencia: {search_result['title']} | {uploader}")
+                uploader = (
+                    search_result.get("uploader")
+                    or search_result.get("channel")
+                    or "desconocido"
+                )
+                print(
+                    f"[{log_prefix}] Mejor coincidencia: {search_result['title']} | {uploader}"
+                )
             else:
                 normalized_query = f"ytsearch:{query}"
 
@@ -191,7 +567,9 @@ class MusicCog(commands.Cog):
         except Exception as exc:
             if search_result is not None:
                 fallback_query = f"ytsearch:{query}"
-                print(f"[{log_prefix}] Fallback a búsqueda directa: {type(exc).__name__}: {exc}")
+                print(
+                    f"[{log_prefix}] Fallback a búsqueda directa: {type(exc).__name__}: {exc}"
+                )
                 print(f"[{log_prefix}] Consultando Lavalink: {fallback_query}")
                 results = await player.node.get_tracks(fallback_query)
             else:
@@ -227,7 +605,9 @@ class MusicCog(commands.Cog):
 
         return player, display_title, started, None
 
-    async def _queue_playlist_query(self, interaction: discord.Interaction, query: str, *, log_prefix: str):
+    async def _queue_playlist_query(
+        self, interaction: discord.Interaction, query: str, *, log_prefix: str
+    ):
         player, error_message = await self._ensure_player(interaction)
         if player is None:
             return None, None, False, error_message
@@ -238,12 +618,19 @@ class MusicCog(commands.Cog):
         if not is_youtube_url(playlist_url):
             playlist_result = await search_public_youtube_playlist(query, limit=8)
             if playlist_result:
-                playlist_url = playlist_result['url']
-                print(f"[{log_prefix}] Mejor coincidencia de playlist: {playlist_result['title']} | {playlist_url}")
+                playlist_url = playlist_result["url"]
+                print(
+                    f"[{log_prefix}] Mejor coincidencia de playlist: {playlist_result['title']} | {playlist_url}"
+                )
             else:
-                return None, None, False, (
-                    f"No encontré una playlist pública con: '{query}'. "
-                    "Prueba con el título exacto + autor o pega la URL directa."
+                return (
+                    None,
+                    None,
+                    False,
+                    (
+                        f"No encontré una playlist pública con: '{query}'. "
+                        "Prueba con el título exacto + autor o pega la URL directa."
+                    ),
                 )
 
         print(f"[{log_prefix}] Consultando Lavalink: {playlist_url}")
@@ -253,14 +640,21 @@ class MusicCog(commands.Cog):
             return None, None, False, f"No pude cargar esa playlist: {exc}"
 
         if not results or not results.tracks:
-            return None, None, False, f"No se encontró ninguna playlist pública con: '{query}'"
+            return (
+                None,
+                None,
+                False,
+                f"No se encontró ninguna playlist pública con: '{query}'",
+            )
 
         tracks = results.tracks
         for track in tracks:
             track.requester = interaction.user.id
             player.add(track)
 
-        playlist_name = getattr(results.playlist_info, 'name', None) or (playlist_result['title'] if playlist_result else 'Playlist')
+        playlist_name = getattr(results.playlist_info, "name", None) or (
+            playlist_result["title"] if playlist_result else "Playlist"
+        )
         display_title = f"{playlist_name} ({len(tracks)} canciones)"
 
         print(f"[{log_prefix}] ✓ En cola playlist: {display_title}")
@@ -273,39 +667,22 @@ class MusicCog(commands.Cog):
 
         return player, display_title, started, None
 
-    @app_commands.command(name="play", description="Reproduce una canción (nombre o URL)")
+    @app_commands.command(
+        name="play", description="Reproduce una canción (nombre o URL)"
+    )
     @app_commands.describe(query="Nombre de la canción o URL de YouTube")
+    @app_commands.autocomplete(query=song_query_autocomplete)
     async def play(self, interaction: discord.Interaction, query: str):
         """
         Buscar y reproducir una canción desde YouTube.
         Acepta nombre de canción o URL directa.
         """
-        await interaction.response.defer()
-
         print(f"\n[PLAY] Iniciando reproducción: {query}")
 
         try:
-            player, display_title, started, error_message = await self._queue_query(
-                interaction,
-                query,
-                log_prefix="PLAY",
+            await self._handle_music_search(
+                interaction, query, mode="play", log_prefix="PLAY"
             )
-            if player is None:
-                print(f"[PLAY] ✗ {error_message}")
-                return await self._send_error(interaction, error_message)
-
-            description = f"**{display_title}**"
-            if started:
-                await self._send_embed(
-                    interaction,
-                    self._build_embed(interaction, "Reproduciendo ahora", description, color=BOT_SUCCESS),
-                )
-            else:
-                await self._send_embed(
-                    interaction,
-                    self._build_embed(interaction, "Añadida a la cola", description, color=BOT_PRIMARY),
-                )
-
         except Exception as e:
             print(f"[PLAY] ✗ ERROR NO CAPTURADO: {type(e).__name__}: {e}")
             import traceback
@@ -315,34 +692,15 @@ class MusicCog(commands.Cog):
 
     @app_commands.command(name="add", description="Añade una canción a la cola")
     @app_commands.describe(query="Nombre de la canción o URL de YouTube")
+    @app_commands.autocomplete(query=song_query_autocomplete)
     async def add(self, interaction: discord.Interaction, query: str):
         """Buscar y añadir una canción a la cola sin interrumpir la actual."""
-        await interaction.response.defer()
-
         print(f"\n[ADD] Añadiendo a la cola: {query}")
 
         try:
-            player, display_title, started, error_message = await self._queue_query(
-                interaction,
-                query,
-                log_prefix="ADD",
+            await self._handle_music_search(
+                interaction, query, mode="add", log_prefix="ADD"
             )
-            if player is None:
-                print(f"[ADD] ✗ {error_message}")
-                return await self._send_error(interaction, error_message)
-
-            description = f"**{display_title}**"
-            if started:
-                await self._send_embed(
-                    interaction,
-                    self._build_embed(interaction, "Añadida y en reproducción", description, color=BOT_SUCCESS),
-                )
-            else:
-                await self._send_embed(
-                    interaction,
-                    self._build_embed(interaction, "Añadida a la cola", description, color=BOT_PRIMARY),
-                )
-
         except Exception as e:
             print(f"[ADD] ✗ ERROR NO CAPTURADO: {type(e).__name__}: {e}")
             import traceback
@@ -351,7 +709,9 @@ class MusicCog(commands.Cog):
             await self._send_error(interaction, f"Error: {e}")
 
     @app_commands.command(name="playlist", description="Reproduce una playlist pública")
-    @app_commands.describe(query="Nombre de la playlist + autor o URL de YouTube/YouTube Music")
+    @app_commands.describe(
+        query="Nombre de la playlist + autor o URL de YouTube/YouTube Music"
+    )
     async def playlist(self, interaction: discord.Interaction, query: str):
         """Buscar y reproducir una playlist pública desde YouTube o YouTube Music."""
         await interaction.response.defer()
@@ -359,7 +719,12 @@ class MusicCog(commands.Cog):
         print(f"\n[PLAYLIST] Iniciando reproducción de playlist: {query}")
 
         try:
-            player, display_title, started, error_message = await self._queue_playlist_query(
+            (
+                player,
+                display_title,
+                started,
+                error_message,
+            ) = await self._queue_playlist_query(
                 interaction,
                 query,
                 log_prefix="PLAYLIST",
@@ -372,12 +737,19 @@ class MusicCog(commands.Cog):
             if started:
                 await self._send_embed(
                     interaction,
-                    self._build_embed(interaction, "Playlist en reproducción", description, color=BOT_SUCCESS),
+                    self._build_embed(
+                        interaction,
+                        "Playlist en reproducción",
+                        description,
+                        color=BOT_SUCCESS,
+                    ),
                 )
             else:
                 await self._send_embed(
                     interaction,
-                    self._build_embed(interaction, "Playlist añadida", description, color=BOT_PRIMARY),
+                    self._build_embed(
+                        interaction, "Playlist añadida", description, color=BOT_PRIMARY
+                    ),
                 )
 
         except Exception as e:
@@ -420,14 +792,28 @@ class MusicCog(commands.Cog):
 
                 message += f"\n**Duración total en cola:** {total_duration}s"
 
-            embed = self._build_embed(interaction, "Cola de reproducción", color=BOT_PRIMARY)
+            embed = self._build_embed(
+                interaction, "Cola de reproducción", color=BOT_PRIMARY
+            )
             if player.current:
                 current = player.current
-                embed.add_field(name="Ahora sonando", value=current.title or "Desconocido", inline=False)
-                embed.add_field(name="Autor", value=current.author or "Desconocido", inline=True)
-                embed.add_field(name="Duración", value=format_duration(current.duration), inline=True)
+                embed.add_field(
+                    name="Ahora sonando",
+                    value=current.title or "Desconocido",
+                    inline=False,
+                )
+                embed.add_field(
+                    name="Autor", value=current.author or "Desconocido", inline=True
+                )
+                embed.add_field(
+                    name="Duración",
+                    value=format_duration(current.duration),
+                    inline=True,
+                )
             else:
-                embed.add_field(name="Ahora sonando", value="Nada en reproducción", inline=False)
+                embed.add_field(
+                    name="Ahora sonando", value="Nada en reproducción", inline=False
+                )
 
             if not player.queue:
                 embed.add_field(name="Siguiente", value="Cola vacía", inline=False)
@@ -436,12 +822,22 @@ class MusicCog(commands.Cog):
                 total_duration = sum(t.duration for t in queue_list)
                 queue_preview = []
                 for i, track in enumerate(queue_list[:10], 1):
-                    queue_preview.append(f"{i}. {track.title} · {format_duration(track.duration)}")
+                    queue_preview.append(
+                        f"{i}. {track.title} · {format_duration(track.duration)}"
+                    )
                 if len(queue_list) > 10:
                     queue_preview.append(f"... y {len(queue_list) - 10} más")
 
-                embed.add_field(name=f"En cola ({len(queue_list)})", value="\n".join(queue_preview), inline=False)
-                embed.add_field(name="Duración total", value=format_duration(total_duration), inline=True)
+                embed.add_field(
+                    name=f"En cola ({len(queue_list)})",
+                    value="\n".join(queue_preview),
+                    inline=False,
+                )
+                embed.add_field(
+                    name="Duración total",
+                    value=format_duration(total_duration),
+                    inline=True,
+                )
 
             await self._send_embed(interaction, embed)
 
@@ -463,7 +859,12 @@ class MusicCog(commands.Cog):
                 print(f"[SKIP] ✓ Saltada: {current_title}")
                 await self._send_embed(
                     interaction,
-                    self._build_embed(interaction, "Canción saltada", f"**{current_title}**", color=BOT_WARNING),
+                    self._build_embed(
+                        interaction,
+                        "Canción saltada",
+                        f"**{current_title}**",
+                        color=BOT_WARNING,
+                    ),
                 )
             else:
                 await self._send_error(interaction, "No hay nada reproduciéndose.")
@@ -486,12 +887,22 @@ class MusicCog(commands.Cog):
                     print(f"[PAUSE] ✓ Pausado: {player.current.title}")
                     await self._send_embed(
                         interaction,
-                        self._build_embed(interaction, "Reproducción en pausa", "La salida quedó detenida temporalmente.", color=BOT_WARNING),
+                        self._build_embed(
+                            interaction,
+                            "Reproducción en pausa",
+                            "La salida quedó detenida temporalmente.",
+                            color=BOT_WARNING,
+                        ),
                     )
                 else:
                     await self._send_embed(
                         interaction,
-                        self._build_embed(interaction, "Ya estaba en pausa", "No se hicieron cambios.", color=BOT_WARNING),
+                        self._build_embed(
+                            interaction,
+                            "Ya estaba en pausa",
+                            "No se hicieron cambios.",
+                            color=BOT_WARNING,
+                        ),
                     )
             else:
                 await self._send_error(interaction, "No hay nada reproduciéndose.")
@@ -514,12 +925,22 @@ class MusicCog(commands.Cog):
                     print(f"[RESUME] ✓ Reanudado: {player.current.title}")
                     await self._send_embed(
                         interaction,
-                        self._build_embed(interaction, "Reproducción reanudada", "La cola sigue avanzando con normalidad.", color=BOT_SUCCESS),
+                        self._build_embed(
+                            interaction,
+                            "Reproducción reanudada",
+                            "La cola sigue avanzando con normalidad.",
+                            color=BOT_SUCCESS,
+                        ),
                     )
                 else:
                     await self._send_embed(
                         interaction,
-                        self._build_embed(interaction, "Ya estaba reproduciendo", "No se hicieron cambios.", color=BOT_PRIMARY),
+                        self._build_embed(
+                            interaction,
+                            "Ya estaba reproduciendo",
+                            "No se hicieron cambios.",
+                            color=BOT_PRIMARY,
+                        ),
                     )
             else:
                 await self._send_error(interaction, "No hay nada reproduciéndose.")
@@ -549,7 +970,12 @@ class MusicCog(commands.Cog):
                 print("[STOP] ✓ Bot desconectado")
                 await self._send_embed(
                     interaction,
-                    self._build_embed(interaction, "Reproducción detenida", "La cola se vació y el bot salió del canal.", color=BOT_ERROR),
+                    self._build_embed(
+                        interaction,
+                        "Reproducción detenida",
+                        "La cola se vació y el bot salió del canal.",
+                        color=BOT_ERROR,
+                    ),
                 )
             else:
                 await self._send_error(interaction, "No estoy conectado.")
@@ -579,14 +1005,24 @@ class MusicCog(commands.Cog):
                     progress_label = progress_bar(position_ms, track.duration)
                     duration_label = f"{format_duration(position_ms)} / {format_duration(track.duration)}"
 
-                embed = self._build_embed(interaction, track.title or "Reproducción actual", color=BOT_PRIMARY)
+                embed = self._build_embed(
+                    interaction, track.title or "Reproducción actual", color=BOT_PRIMARY
+                )
                 if track.uri:
                     embed.url = track.uri
 
-                embed.add_field(name="Autor", value=track.author or "Desconocido", inline=True)
-                embed.add_field(name="Estado", value="En vivo" if track.is_stream else "En reproducción", inline=True)
+                embed.add_field(
+                    name="Autor", value=track.author or "Desconocido", inline=True
+                )
+                embed.add_field(
+                    name="Estado",
+                    value="En vivo" if track.is_stream else "En reproducción",
+                    inline=True,
+                )
                 embed.add_field(name="Duración", value=duration_label, inline=True)
-                embed.add_field(name="Progreso", value=f"`{progress_label}`", inline=False)
+                embed.add_field(
+                    name="Progreso", value=f"`{progress_label}`", inline=False
+                )
 
                 if not track.is_stream:
                     percent = min((position_ms / max(track.duration, 1)) * 100, 100.0)
