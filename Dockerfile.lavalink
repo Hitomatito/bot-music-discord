@@ -1,0 +1,32 @@
+FROM eclipse-temurin:21-jre-jammy
+
+ARG LAVALINK_VERSION=4.2.2
+ARG YOUTUBE_PLUGIN_VERSION=1.18.0
+ARG YOUTUBE_PLUGIN_JAR=youtube-plugin-1.18.0.jar
+
+ENV LAVALINK_HOME=/opt/lavalink
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends curl ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN useradd --create-home --shell /usr/sbin/nologin lavalink
+
+WORKDIR /opt/lavalink
+
+RUN mkdir -p plugins \
+    && curl -fsSL -o Lavalink.jar "https://github.com/lavalink-devs/Lavalink/releases/download/${LAVALINK_VERSION}/Lavalink.jar" \
+    && curl -fsSL -o "plugins/${YOUTUBE_PLUGIN_JAR}" "https://github.com/lavalink-devs/youtube-source/releases/download/${YOUTUBE_PLUGIN_VERSION}/${YOUTUBE_PLUGIN_JAR}"
+
+COPY --chown=lavalink:lavalink lavalink/application.yml ./application.yml
+
+RUN chown -R lavalink:lavalink /opt/lavalink
+
+USER lavalink
+
+EXPOSE 2333
+
+HEALTHCHECK --interval=10s --timeout=5s --start-period=20s --retries=12 \
+    CMD sh -c 'curl -fsS -H "Authorization: ${LAVALINK_PASSWORD}" http://localhost:2333/version >/dev/null'
+
+CMD ["java", "-jar", "Lavalink.jar", "--spring.config.additional-location=file:./"]
