@@ -296,48 +296,55 @@ def _candidate_music_query_pairs(query: str) -> list[tuple[str, str]]:
     return unique_pairs
 
 
-def _candidate_search_queries(query: str) -> list[str]:
-    cleaned_query = (query or "").strip()
-    if not cleaned_query:
-        return [""]
-
-    title_query, artist_query = _split_music_query(cleaned_query)
-    candidate_queries = [cleaned_query]
-
-    if "audio" not in _normalize_search_text(cleaned_query):
-        candidate_queries.append(f"{cleaned_query} audio")
-
-    if not artist_query:
-        candidate_queries.append(f"{cleaned_query} official audio")
-        candidate_queries.append(f"{cleaned_query} official video")
-
-    if title_query and artist_query:
-        candidate_queries.append(f"{title_query} {artist_query}")
-        candidate_queries.append(f"{artist_query} {title_query}")
-        candidate_queries.append(f"{title_query} - {artist_query}")
-        candidate_queries.append(f"{artist_query} - {title_query}")
-        candidate_queries.append(f"{title_query} by {artist_query}")
-        candidate_queries.append(f"{artist_query} by {title_query}")
-        candidate_queries.append(title_query)
-        candidate_queries.append(artist_query)
-
-    if "," not in cleaned_query and " by " not in cleaned_query:
-        tokens = cleaned_query.split()
-        if len(tokens) >= 3:
-            candidate_queries.append(" ".join(reversed(tokens)))
-
-    unique_queries: list[str] = []
-    seen_queries: set[str] = set()
-    for candidate_query in candidate_queries:
-        normalized_query = candidate_query.strip()
-        if normalized_query and normalized_query not in seen_queries:
-            seen_queries.add(normalized_query)
-            unique_queries.append(normalized_query)
-
-        if len(unique_queries) >= 5:
-            break
-
-    return unique_queries
+def _build_music_query_variants(query: str) -> list[str]:
+    """Genera variantes de búsqueda para mejorar命中率.
+    
+    Variantes generadas:
+    - query original
+    - "query audio" (para excluir lyrics/mixes)
+    - "query oficial" si no tiene artista
+    - "canción - artista" y "artista - canción"
+    - "canción by artista" y "artista by canción"
+    """
+    cleaned = (query or "").strip()
+    if not cleaned:
+        return []
+    
+    variants = []
+    seen = set()
+    
+    title, artist = _split_music_query(cleaned)
+    normalized_clean = _normalize_search_text(cleaned)
+    
+    variants.append(cleaned)
+    seen.add(normalized_clean)
+    
+    if "audio" not in normalized_clean and "official" not in normalized_clean:
+        variants.append(f"{cleaned} audio")
+        seen.add(f"{normalized_clean} audio")
+    
+    if not artist:
+        variants.append(f"{cleaned} official")
+        seen.add(f"{normalized_clean} official")
+    
+    if title and artist:
+        combos = [
+            f"{title} {artist}",
+            f"{artist} {title}",
+            f"{title} - {artist}",
+            f"{artist} - {title}",
+            f"{title} by {artist}",
+            f"{artist} by {title}",
+            title,
+            artist,
+        ]
+        for combo in combos:
+            norm = _normalize_search_text(combo)
+            if norm and norm not in seen:
+                variants.append(combo)
+                seen.add(norm)
+    
+    return variants[:5]
 
 
 def _candidate_playlist_search_queries(query: str) -> list[str]:
@@ -538,6 +545,67 @@ async def search_public_youtube_playlist(query: str, limit: int = 5):
             )
 
     return None
+
+
+def _calculate_views_score(views_str: str) -> float:
+    """Calcula score basado en views de YouTube Music."""
+    if not views_str:
+        return 0.0
+    
+    try:
+        views_str = views_str.upper().strip()
+        
+        multiplier = 1.0
+        if "CR" in views_str:
+            multiplier = 1_000_000_000
+            views_str = views_str.replace("CR", "")
+        elif "M" in views_str:
+            multiplier = 1_000_000
+            views_str = views_str.replace("M", "")
+        elif "K" in views_str:
+            multiplier = 1_000
+            views_str = views_str.replace("K", "")
+        
+        views_str = views_str.replace(",", "").replace(".", "").strip()
+        if views_str:
+            views = float(views_str) * multiplier
+            return math.log10(views + 1) * 1.5
+    except (ValueError, AttributeError):
+        pass
+    
+    return 0.0
+
+
+def _is_unwanted_content(title: str, uploader: str) -> bool:
+    """Determina si el contenido es no deseado (mixes, livestreams, etc)."""
+    normalized_title = _normalize_search_text(title)
+    normalized_uploader = _normalize_search_text(uploader)
+    
+    unwanted_patterns = (
+        "mix",
+        "megamix",
+        " Compilation ",
+        "livestream",
+        "live stream",
+        "concierto",
+        "concert",
+        "festival live",
+        "directo",
+        "1 hour",
+        " hour ",
+        "loop",
+        "relaxation",
+        "sleep",
+        "study",
+        "lullaby",
+        "asleep",
+    )
+    
+    for pattern in unwanted_patterns:
+        if pattern.lower() in normalized_title:
+            return True
+            
+    return False
 
 
 def _score_youtube_result_for_pair(
@@ -808,16 +876,18 @@ def _score_youtube_result_for_pair(
     duration = entry.get("duration") or 0
     if duration:
         if duration < 45:
-            score -= 8.0
-        elif 180 <= duration <= 420:
-            score += 1.5
-
+            score -= 10.0
+        elif 120 <= duration <= 300:
+            score += 8.0
+        elif 300 < duration <= 420:
+            score += 3.0
+    
     score -= len(title_text.split()) * 0.15
 
-    view_count = entry.get("view_count") or 0
-    if view_count and not artist_query_text:
-        score += math.log10(view_count + 1) * 2.2
-
+    views = entry.get("views", "") or ""
+    if views:
+        score += _calculate_views_score(views)
+        
     if not artist_query_text:
         extra_noise_markers = (
             "animacion",
@@ -879,7 +949,11 @@ _YOUTUBE_VIDEO_CACHE: dict[str, tuple[float, dict]] = {}
 
 
 async def search_youtube_candidates(query: str, limit: int = 5):
-    """Buscar candidatos ordenados para sugerencias y selección manual."""
+    """Buscar candidatos ordenados para sugerencias y selección manual.
+    
+    Usa YouTube Music como fuente principal y yt-dlp como fallback.
+    YouTube Music es más preciso para búsquedas de música.
+    """
     cleaned_query = (query or "").strip()
     if not cleaned_query:
         return []
@@ -891,27 +965,80 @@ async def search_youtube_candidates(query: str, limit: int = 5):
         return cached[1]
 
     candidate_videos = []
+    seen_titles = set()
     seen_ids = set()
 
-    candidate_queries = _candidate_search_queries(cleaned_query)[:3]
-    search_results = await asyncio.gather(
-        *(
-            search_youtube(candidate_query, limit=limit)
-            for candidate_query in candidate_queries
-        )
-    )
+    query_variants = _build_music_query_variants(cleaned_query)
 
-    for videos in search_results:
-        for video in videos:
+    # Primero: YouTube Music (fuente principal para música)
+    try:
+        print(f"[SEARCH] YouTube Music principal: {cleaned_query}")
+        ytm_results = await search_youtube_music(cleaned_query, limit=limit * 3)
+        
+        for video in ytm_results:
             video_id = video.get("id")
-            if video_id and video_id not in seen_ids:
-                seen_ids.add(video_id)
-                scored_video = dict(video)
-                scored_video["score"] = _score_youtube_result_for_best_match(
-                    cleaned_query, scored_video
+            title = video.get("title", "")
+            uploader = video.get("uploader", "")
+            
+            if not video_id:
+                continue
+            
+            normalized_title = _normalize_search_text(title)
+            if normalized_title in seen_titles:
+                continue
+            
+            if _is_unwanted_content(title, uploader):
+                continue
+            
+            seen_titles.add(normalized_title)
+            seen_ids.add(video_id)
+            
+            scored_video = dict(video)
+            scored_video["source"] = "ytmusic"
+            scored_video["score"] = _score_youtube_result_for_best_match(
+                cleaned_query, scored_video
+            )
+            candidate_videos.append(scored_video)
+            _YOUTUBE_VIDEO_CACHE[video_id] = (now, scored_video)
+        print(f"[SEARCH] YTM resultados: {len(ytm_results)}")
+    except Exception as e:
+        print(f"[SEARCH] Error en YouTube Music: {e}")
+
+    # Fallback: yt-dlp si YTM no tiene resultados suficientes
+    if len(candidate_videos) < limit:
+        print(f"[SEARCH] Fallback a yt-dlp...")
+        try:
+            search_results = await asyncio.gather(
+                *(
+                    search_youtube(q, limit=limit)
+                    for q in query_variants
                 )
-                candidate_videos.append(scored_video)
-                _YOUTUBE_VIDEO_CACHE[video_id] = (now, scored_video)
+            )
+
+            for videos in search_results:
+                for video in videos:
+                    video_id = video.get("id")
+                    title = video.get("title", "")
+                    
+                    if not video_id:
+                        continue
+                    
+                    normalized_title = _normalize_search_text(title)
+                    if normalized_title in seen_titles:
+                        continue
+                    
+                    seen_titles.add(normalized_title)
+                    seen_ids.add(video_id)
+                    
+                    scored_video = dict(video)
+                    scored_video["source"] = "ytdlp"
+                    scored_video["score"] = _score_youtube_result_for_best_match(
+                        cleaned_query, scored_video
+                    )
+                    candidate_videos.append(scored_video)
+                    _YOUTUBE_VIDEO_CACHE[video_id] = (now, scored_video)
+        except Exception as e:
+            print(f"[SEARCH] Error en yt-dlp fallback: {e}")
 
     if not candidate_videos:
         _YOUTUBE_CANDIDATE_CACHE[cache_key] = (now, [])
@@ -1064,3 +1191,95 @@ async def get_youtube_info(url: str):
     except Exception as e:
         print(f"[YT-DLP] Error obteniendo info: {e}")
         return None
+
+
+_YOUTUBE_MUSIC_CACHE = {}
+
+
+async def search_youtube_music(query: str, limit: int = 5):
+    """Buscar canciones en YouTube Music usando la API de YouTube Music.
+
+    Args:
+        query: Término de búsqueda
+        limit: Número máximo de resultados
+
+    Returns:
+        Lista de diccionarios con información de las canciones
+    """
+    from YouTubeMusic import Search as YTM_Search
+
+    cache_key = (query.lower(), limit)
+    cached = _YOUTUBE_MUSIC_CACHE.get(cache_key)
+    now = time.monotonic()
+    if cached and now - cached[0] < 60:
+        return cached[1]
+
+    try:
+        print(f"[YTM] Buscando: {query}")
+        
+        videos = []
+        processed_titles = set()
+        
+        for variant in _build_music_query_variants(query):
+            if not variant:
+                continue
+                
+            try:
+                results = await YTM_Search(variant, limit=limit)
+            except Exception as e:
+                print(f"[YTM] Error en búsqueda '{variant}': {e}")
+                continue
+                
+            if not results or not results.get("main_results"):
+                continue
+                
+            for entry in results.get("main_results", []):
+                if not entry:
+                    continue
+                    
+                video_id = entry.get("video_id") or entry.get("id")
+                if not video_id:
+                    continue
+                
+                title = entry.get("title", "")
+                if not title:
+                    continue
+                    
+                normalized_title = _normalize_search_text(title)
+                if normalized_title in processed_titles:
+                    continue
+                processed_titles.add(normalized_title)
+                
+                thumbnails = entry.get("thumbnails", [])
+                thumbnail = thumbnails[0].get("url") if thumbnails else None
+
+                duration_str = entry.get("duration", "")
+                duration = 0
+                if duration_str:
+                    parts = duration_str.split(":")
+                    if len(parts) == 2:
+                        duration = int(parts[0]) * 60 + int(parts[1])
+                    elif len(parts) == 3:
+                        duration = int(parts[0]) * 3600 + int(parts[1]) * 60 + int(parts[2])
+                
+                views_str = entry.get("views", "")
+                
+                videos.append(
+                    {
+                        "url": f"https://www.youtube.com/watch?v={video_id}",
+                        "title": title,
+                        "duration": duration,
+                        "id": video_id,
+                        "thumbnail": thumbnail,
+                        "uploader": entry.get("channel"),
+                        "channel": entry.get("channel"),
+                        "views": views_str,
+                    }
+                )
+        
+        _YOUTUBE_MUSIC_CACHE[cache_key] = (now, videos)
+        return videos
+
+    except Exception as e:
+        print(f"[YTM] Error buscando: {e}")
+        return []
