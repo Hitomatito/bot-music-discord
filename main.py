@@ -43,11 +43,24 @@ class MusicBot(commands.Bot):
     async def on_ready(self) -> None:
         self._ensure_lavalink()
 
-        if not self._slash_synced:
-            synced = await self.tree.sync()
-            self._slash_synced = True
-            print(f"[{self.user}] {len(synced)} comandos slash sincronizados", flush=True)
-
+        # Borrar comandos globales y sincronizar por guild (instantáneo)
+        try:
+            global_cmds = await self.tree.fetch_commands()
+            print(f"[SYNC] Borrando {len(global_cmds)} comandos globales...", flush=True)
+            for cmd in global_cmds:
+                self.tree.remove_command(cmd.id)
+            print(f"[SYNC] Comandos globales borrados", flush=True)
+        except Exception as e:
+            print(f"[SYNC] Error borrando globales: {e}", flush=True)
+        
+        # Sincronizar por guild (aparece instantáneamente)
+        for guild in self.guilds:
+            try:
+                synced = await self.tree.sync(guild=guild)
+                print(f"[SYNC] {guild.name}: {len(synced)} comandos", flush=True)
+            except Exception as e:
+                print(f"[SYNC] Error en {guild.name}: {e}", flush=True)
+        
         print(f"Bot listo como {self.user} en {len(self.guilds)} servidores", flush=True)
 
 

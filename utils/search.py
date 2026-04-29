@@ -14,8 +14,6 @@ from urllib.request import Request, urlopen
 
 
 def _normalize_search_text(text: str) -> str:
-    ydl_opts = {
-def _normalize_search_text(text: str) -> str:
     normalized = unicodedata.normalize("NFKD", text or "")
     normalized = "".join(
         character for character in normalized if not unicodedata.combining(character)

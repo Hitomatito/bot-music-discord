@@ -153,12 +153,19 @@ async def song_query_autocomplete(interaction: discord.Interaction, current: str
 class MusicCog(commands.Cog):
     def __init__(self, bot):
         self.bot = bot
-        # guilds that have autoplay (music continuation) enabled
+        # Autoplay SIEMPRE activo para todos los servidores
         self._autoplay_guilds: set[int] = set()
         # last track info per guild, used to seed autoplay searches
         self._last_track_info: dict[int, dict] = {}
         # guard against registering lavalink event hooks more than once
         self._hooks_registered: bool = False
+
+    async def cog_load(self) -> None:
+        """Se ejecuta cuando se carga el Cog - activa autoplay en todos los servidores."""
+        await self.bot.wait_until_ready()
+        for guild in self.bot.guilds:
+            self._autoplay_guilds.add(guild.id)
+        print(f"[AUTOPLAY] Activado automáticamente en {len(self._autoplay_guilds)} servidores")
 
     def _get_bot_member(self, interaction: discord.Interaction):
         if interaction.guild is None or self.bot.user is None:
