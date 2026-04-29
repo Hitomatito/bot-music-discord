@@ -4,9 +4,8 @@
 # Direct dependencies
 discord.py[voice]==2.7.1
 lavalink==5.11.0
-yt-dlp==2026.3.17
 
-# YouTube Music search (fallback)
+# YouTube Music search
 YouTubeMusic==2026.3.26
 
 # Transitive runtime dependencies used by discord.py / lavalink / voice support
