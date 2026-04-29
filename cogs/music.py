@@ -346,7 +346,11 @@ class MusicCog(commands.Cog):
         mode: str,
         log_prefix: str,
     ):
-        await interaction.response.defer()  # ← AHORA AL INICIO (da 15 min)
+        # Verificar si ya fue respondida (por autocomplete u otro)
+        if not interaction.response.is_done():
+            await interaction.response.defer()
+        else:
+            print(f"[{log_prefix}] ⚠ Interacción ya respondida, saltando defer()")
         
         if is_youtube_url(query):
             player, display_title, started, error_message = await self._queue_query(
@@ -380,7 +384,6 @@ class MusicCog(commands.Cog):
                 )
             return
 
-        await interaction.response.defer()
         candidates = await self._build_song_choices(
             query, limit=SEARCH_SUGGESTION_LIMIT
         )
@@ -685,8 +688,6 @@ class MusicCog(commands.Cog):
         """
         print(f"\n[PLAY] Iniciando reproducción: {query}")
         
-        await interaction.response.defer()
-        
         try:
             await self._handle_music_search(
                 interaction, query, mode="play", log_prefix="PLAY"
@@ -704,8 +705,6 @@ class MusicCog(commands.Cog):
     async def add(self, interaction: discord.Interaction, query: str):
         """Buscar y añadir una canción a la cola sin interrumpir la actual."""
         print(f"\n[ADD] Añadiendo a la cola: {query}")
-        
-        await interaction.response.defer()
         
         try:
             await self._handle_music_search(
