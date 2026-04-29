@@ -1,6 +1,6 @@
 """
 Utilidades para búsqueda y reproducción de música
-Usa yt-dlp para búsquedas y obtener URLs que Lavalink puede reproducir
+Usa YouTube Music para búsquedas
 """
 
 import asyncio
@@ -12,22 +12,9 @@ import time
 from urllib.parse import parse_qs, quote_plus, unquote, urlparse
 from urllib.request import Request, urlopen
 
-import yt_dlp
 
-
-def _search_youtube_sync(query: str, limit: int):
+def _normalize_search_text(text: str) -> str:
     ydl_opts = {
-        "quiet": True,
-        "no_warnings": True,
-        "extract_flat": True,
-        "skip_download": True,
-    }
-
-    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-        print(f"[YT-DLP] Buscando: {query}")
-        return ydl.extract_info(f"ytsearch{limit}:{query}", download=False)
-
-
 def _normalize_search_text(text: str) -> str:
     normalized = unicodedata.normalize("NFKD", text or "")
     normalized = "".join(
@@ -515,7 +502,7 @@ async def search_public_youtube_playlist(query: str, limit: int = 5):
                 _search_duckduckgo_sync, candidate_query, limit
             )
         except Exception as exc:
-            print(f"[YT-DLP] Error buscando playlist: {exc}")
+            print(f"[DUCKDUCKGO] Error buscando playlist: {exc}")
             continue
 
         candidate_playlists = []
@@ -951,8 +938,7 @@ _YOUTUBE_VIDEO_CACHE: dict[str, tuple[float, dict]] = {}
 async def search_youtube_candidates(query: str, limit: int = 5):
     """Buscar candidatos ordenados para sugerencias y selección manual.
     
-    Usa YouTube Music como fuente principal y yt-dlp como fallback.
-    YouTube Music es más preciso para búsquedas de música.
+    Usa YouTube Music como fuente para búsquedas de música.
     """
     cleaned_query = (query or "").strip()
     if not cleaned_query:
@@ -968,11 +954,9 @@ async def search_youtube_candidates(query: str, limit: int = 5):
     seen_titles = set()
     seen_ids = set()
 
-    query_variants = _build_music_query_variants(cleaned_query)
-
-    # Primero: YouTube Music (fuente principal para música)
+    # YouTube Music (fuente para música)
     try:
-        print(f"[SEARCH] YouTube Music principal: {cleaned_query}")
+        print(f"[SEARCH] YouTube Music: {cleaned_query}")
         ytm_results = await search_youtube_music(cleaned_query, limit=limit * 3)
         
         for video in ytm_results:
@@ -1004,42 +988,6 @@ async def search_youtube_candidates(query: str, limit: int = 5):
     except Exception as e:
         print(f"[SEARCH] Error en YouTube Music: {e}")
 
-    # Fallback: yt-dlp si YTM no tiene resultados suficientes
-    if len(candidate_videos) < limit:
-        print(f"[SEARCH] Fallback a yt-dlp...")
-        try:
-            search_results = await asyncio.gather(
-                *(
-                    search_youtube(q, limit=limit)
-                    for q in query_variants
-                )
-            )
-
-            for videos in search_results:
-                for video in videos:
-                    video_id = video.get("id")
-                    title = video.get("title", "")
-                    
-                    if not video_id:
-                        continue
-                    
-                    normalized_title = _normalize_search_text(title)
-                    if normalized_title in seen_titles:
-                        continue
-                    
-                    seen_titles.add(normalized_title)
-                    seen_ids.add(video_id)
-                    
-                    scored_video = dict(video)
-                    scored_video["source"] = "ytdlp"
-                    scored_video["score"] = _score_youtube_result_for_best_match(
-                        cleaned_query, scored_video
-                    )
-                    candidate_videos.append(scored_video)
-                    _YOUTUBE_VIDEO_CACHE[video_id] = (now, scored_video)
-        except Exception as e:
-            print(f"[SEARCH] Error en yt-dlp fallback: {e}")
-
     if not candidate_videos:
         _YOUTUBE_CANDIDATE_CACHE[cache_key] = (now, [])
         return []
@@ -1067,59 +1015,6 @@ def resolve_youtube_candidate(token: str) -> dict | None:
         return None
 
     return dict(candidate)
-
-
-def _get_youtube_info_sync(url: str):
-    ydl_opts = {
-        "quiet": True,
-        "no_warnings": True,
-        "skip_download": True,
-        "format": "bestaudio/best",
-    }
-
-    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-        print(f"[YT-DLP] Obteniendo info: {url}")
-        return ydl.extract_info(url, download=False)
-
-
-async def search_youtube(query: str, limit: int = 5):
-    """
-    Buscar canciones en YouTube usando yt-dlp
-
-    Args:
-        query: Término de búsqueda (ej: "Esta noche Kevin Kaarl")
-        limit: Número máximo de resultados
-
-    Returns:
-        Lista de diccionarios con información de las canciones
-    """
-    try:
-        results = await asyncio.to_thread(_search_youtube_sync, query, limit)
-
-        if not results or "entries" not in results:
-            return []
-
-        videos = []
-        for entry in results["entries"]:
-            if entry:
-                videos.append(
-                    {
-                        "url": f"https://www.youtube.com/watch?v={entry['id']}",
-                        "title": entry.get("title", "Unknown"),
-                        "duration": entry.get("duration", 0),
-                        "id": entry.get("id"),
-                        "thumbnail": entry.get("thumbnail"),
-                        "uploader": entry.get("uploader"),
-                        "channel": entry.get("channel"),
-                        "view_count": entry.get("view_count"),
-                    }
-                )
-
-        return videos
-
-    except Exception as e:
-        print(f"[YT-DLP] Error buscando: {e}")
-        return []
 
 
 async def search_youtube_best_match(query: str, limit: int = 8):
@@ -1154,43 +1049,6 @@ def is_youtube_url(text: str) -> bool:
         "youtube-nocookie.com",
         "music.youtube.com",
     }
-
-
-async def get_youtube_info(url: str):
-    """
-    Obtener información de una URL de YouTube incluyendo la URL de audio
-
-    Args:
-        url: URL de YouTube
-
-    Returns:
-        Diccionario con información del video incluyendo URL de audio
-    """
-    try:
-        info = await asyncio.to_thread(_get_youtube_info_sync, url)
-
-        audio_url = None
-        if "url" in info:
-            audio_url = info["url"]
-        elif "formats" in info and len(info["formats"]) > 0:
-            for fmt in info["formats"]:
-                if fmt.get("vcodec") == "none" and fmt.get("acodec") != "none":
-                    audio_url = fmt.get("url")
-                    break
-            if not audio_url:
-                audio_url = info["formats"][0].get("url")
-
-        return {
-            "url": audio_url or url,
-            "title": info.get("title", "Unknown"),
-            "duration": info.get("duration", 0),
-            "id": info.get("id"),
-            "thumbnail": info.get("thumbnail"),
-        }
-
-    except Exception as e:
-        print(f"[YT-DLP] Error obteniendo info: {e}")
-        return None
 
 
 _YOUTUBE_MUSIC_CACHE = {}
