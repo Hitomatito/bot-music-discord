@@ -346,6 +346,8 @@ class MusicCog(commands.Cog):
         mode: str,
         log_prefix: str,
     ):
+        await interaction.response.defer()  # ← AHORA AL INICIO (da 15 min)
+        
         if is_youtube_url(query):
             player, display_title, started, error_message = await self._queue_query(
                 interaction, query, log_prefix=log_prefix
@@ -441,32 +443,36 @@ class MusicCog(commands.Cog):
 
         return player, None
 
-    async def _wait_for_remote_voice(self, player, timeout: float = 10.0) -> bool:
+    async def _wait_for_remote_voice(self, player, timeout: float = 15.0) -> bool:
         """Espera a que Lavalink marque la sesión de voz como conectada."""
         deadline = asyncio.get_running_loop().time() + timeout
+        retries = 0
 
         while asyncio.get_running_loop().time() < deadline:
             try:
                 raw_player = await player.node.get_player(player.guild_id)
-            except Exception as exc:
+                state = raw_player.get("state", {})
                 print(
-                    f"[VOICE] estado remoto no disponible todavía: {type(exc).__name__}: {exc}",
+                    f"[VOICE] estado remoto guild={player.guild_id} connected={state.get('connected')} position={state.get('position')} ping={state.get('ping')}",
                     flush=True,
                 )
+
+                if state.get("connected"):
+                    return True
+
+            except Exception as exc:
+                retries += 1
+                if retries <= 3:
+                    print(
+                        f"[VOICE] estado remoto no disponible todavía (intento {retries}): {type(exc).__name__}: {exc}",
+                        flush=True,
+                    )
                 await asyncio.sleep(0.5)
                 continue
 
-            state = raw_player.get("state", {})
-            print(
-                f"[VOICE] estado remoto guild={player.guild_id} connected={state.get('connected')} position={state.get('position')} ping={state.get('ping')}",
-                flush=True,
-            )
-
-            if state.get("connected"):
-                return True
-
             await asyncio.sleep(0.5)
 
+        print(f"[VOICE] Timeout esperando conexión remota después de {timeout}s", flush=True)
         return False
 
     async def _ensure_player(self, interaction: discord.Interaction):
@@ -678,7 +684,9 @@ class MusicCog(commands.Cog):
         Acepta nombre de canción o URL directa.
         """
         print(f"\n[PLAY] Iniciando reproducción: {query}")
-
+        
+        await interaction.response.defer()
+        
         try:
             await self._handle_music_search(
                 interaction, query, mode="play", log_prefix="PLAY"
@@ -696,7 +704,9 @@ class MusicCog(commands.Cog):
     async def add(self, interaction: discord.Interaction, query: str):
         """Buscar y añadir una canción a la cola sin interrumpir la actual."""
         print(f"\n[ADD] Añadiendo a la cola: {query}")
-
+        
+        await interaction.response.defer()
+        
         try:
             await self._handle_music_search(
                 interaction, query, mode="add", log_prefix="ADD"

@@ -951,8 +951,7 @@ _YOUTUBE_VIDEO_CACHE: dict[str, tuple[float, dict]] = {}
 async def search_youtube_candidates(query: str, limit: int = 5):
     """Buscar candidatos ordenados para sugerencias y selección manual.
     
-    Usa YouTube Music como fuente principal y yt-dlp como fallback.
-    YouTube Music es más preciso para búsquedas de música.
+    Usa YouTube Music como fuente para búsquedas de música.
     """
     cleaned_query = (query or "").strip()
     if not cleaned_query:
@@ -968,11 +967,9 @@ async def search_youtube_candidates(query: str, limit: int = 5):
     seen_titles = set()
     seen_ids = set()
 
-    query_variants = _build_music_query_variants(cleaned_query)
-
-    # Primero: YouTube Music (fuente principal para música)
+    # YouTube Music (fuente para música)
     try:
-        print(f"[SEARCH] YouTube Music principal: {cleaned_query}")
+        print(f"[SEARCH] YouTube Music: {cleaned_query}")
         ytm_results = await search_youtube_music(cleaned_query, limit=limit * 3)
         
         for video in ytm_results:
@@ -1003,42 +1000,6 @@ async def search_youtube_candidates(query: str, limit: int = 5):
         print(f"[SEARCH] YTM resultados: {len(ytm_results)}")
     except Exception as e:
         print(f"[SEARCH] Error en YouTube Music: {e}")
-
-    # Fallback: yt-dlp si YTM no tiene resultados suficientes
-    if len(candidate_videos) < limit:
-        print(f"[SEARCH] Fallback a yt-dlp...")
-        try:
-            search_results = await asyncio.gather(
-                *(
-                    search_youtube(q, limit=limit)
-                    for q in query_variants
-                )
-            )
-
-            for videos in search_results:
-                for video in videos:
-                    video_id = video.get("id")
-                    title = video.get("title", "")
-                    
-                    if not video_id:
-                        continue
-                    
-                    normalized_title = _normalize_search_text(title)
-                    if normalized_title in seen_titles:
-                        continue
-                    
-                    seen_titles.add(normalized_title)
-                    seen_ids.add(video_id)
-                    
-                    scored_video = dict(video)
-                    scored_video["source"] = "ytdlp"
-                    scored_video["score"] = _score_youtube_result_for_best_match(
-                        cleaned_query, scored_video
-                    )
-                    candidate_videos.append(scored_video)
-                    _YOUTUBE_VIDEO_CACHE[video_id] = (now, scored_video)
-        except Exception as e:
-            print(f"[SEARCH] Error en yt-dlp fallback: {e}")
 
     if not candidate_videos:
         _YOUTUBE_CANDIDATE_CACHE[cache_key] = (now, [])
