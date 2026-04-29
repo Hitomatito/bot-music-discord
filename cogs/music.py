@@ -31,6 +31,8 @@ SEARCH_PREVIEW_LIMIT = 5
 
 # Number of tracks to auto-queue when the queue runs dry
 AUTOPLAY_FILL_TRACKS = 5
+# Extra candidates to fetch beyond the target fill count (to filter out seed/duplicates)
+AUTOPLAY_SEARCH_BUFFER = 5
 
 
 @dataclass(slots=True)
@@ -699,7 +701,7 @@ class MusicCog(commands.Cog):
         print(f"[AUTOPLAY] Buscando canciones relacionadas con: {query!r}")
 
         try:
-            candidates = await search_youtube_candidates(query, limit=AUTOPLAY_FILL_TRACKS + 5)
+            candidates = await search_youtube_candidates(query, limit=AUTOPLAY_FILL_TRACKS + AUTOPLAY_SEARCH_BUFFER)
         except Exception as exc:
             print(f"[AUTOPLAY] Error en búsqueda: {exc}")
             return 0
@@ -1194,10 +1196,21 @@ class MusicCog(commands.Cog):
         if self._hooks_registered:
             return
         lavalink_client = self._get_lavalink_client()
-        if lavalink_client is not None:
-            lavalink_client.add_event_hooks(self)
-            self._hooks_registered = True
-            print("[AUTOPLAY] Hooks de eventos Lavalink registrados")
+        if lavalink_client is None:
+            # Lavalink is initialised in the bot's own on_ready which runs
+            # first; if it's still None here something is wrong – skip and
+            # let the next on_ready attempt register.
+            print("[AUTOPLAY] Lavalink no disponible en on_ready, se reintentará")
+            return
+        lavalink_client.add_event_hooks(self)
+        self._hooks_registered = True
+        print("[AUTOPLAY] Hooks de eventos Lavalink registrados")
+
+    @commands.Cog.listener()
+    async def on_guild_remove(self, guild: discord.Guild) -> None:
+        """Clean up per-guild state when the bot leaves a server."""
+        self._autoplay_guilds.discard(guild.id)
+        self._last_track_info.pop(guild.id, None)
 
 
 async def setup(bot):
