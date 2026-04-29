@@ -29,6 +29,11 @@ from utils.search import (
 SEARCH_SUGGESTION_LIMIT = 10
 SEARCH_PREVIEW_LIMIT = 5
 
+# Number of tracks to auto-queue when the queue runs dry
+AUTOPLAY_FILL_TRACKS = 5
+# Extra candidates to fetch beyond the target fill count (to filter out seed/duplicates)
+AUTOPLAY_SEARCH_BUFFER = 5
+
 
 @dataclass(slots=True)
 class SearchChoice:
@@ -148,6 +153,12 @@ async def song_query_autocomplete(interaction: discord.Interaction, current: str
 class MusicCog(commands.Cog):
     def __init__(self, bot):
         self.bot = bot
+        # guilds that have autoplay (music continuation) enabled
+        self._autoplay_guilds: set[int] = set()
+        # last track info per guild, used to seed autoplay searches
+        self._last_track_info: dict[int, dict] = {}
+        # guard against registering lavalink event hooks more than once
+        self._hooks_registered: bool = False
 
     def _get_bot_member(self, interaction: discord.Interaction):
         if interaction.guild is None or self.bot.user is None:
@@ -676,6 +687,146 @@ class MusicCog(commands.Cog):
 
         return player, display_title, started, None
 
+    # ------------------------------------------------------------------
+    # Autoplay (music continuation) helpers
+    # ------------------------------------------------------------------
+
+    async def _autofill_queue(self, player) -> int:
+        """Search for related tracks and add them to the player queue.
+
+        Uses the last known track title + author as a seed query.
+        Returns the number of tracks added.
+        """
+        guild_id = player.guild_id
+        seed_info = self._last_track_info.get(guild_id, {})
+        title = seed_info.get("title") or ""
+        author = seed_info.get("author") or ""
+
+        if not title:
+            print("[AUTOPLAY] No hay información de la última canción para semilla")
+            return 0
+
+        query = f"{title} {author}".strip() if author else title
+        print(f"[AUTOPLAY] Buscando canciones relacionadas con: {query!r}")
+
+        try:
+            candidates = await search_youtube_candidates(query, limit=AUTOPLAY_FILL_TRACKS + AUTOPLAY_SEARCH_BUFFER)
+        except Exception as exc:
+            print(f"[AUTOPLAY] Error en búsqueda: {exc}")
+            return 0
+
+        added = 0
+        queued_titles: set[str] = set()
+
+        # Skip the seed track itself so we don't repeat it immediately
+        seed_title_norm = title.lower().strip()
+
+        for candidate in candidates:
+            if added >= AUTOPLAY_FILL_TRACKS:
+                break
+
+            cand_title = (candidate.get("title") or "").lower().strip()
+            cand_url = candidate.get("url") or ""
+
+            if not cand_url:
+                continue
+
+            # Skip if it's the same as the seed or a duplicate
+            if cand_title == seed_title_norm or cand_title in queued_titles:
+                continue
+
+            try:
+                results = await player.node.get_tracks(cand_url)
+            except Exception as exc:
+                print(f"[AUTOPLAY] Error cargando pista {cand_url}: {exc}")
+                continue
+
+            if not results or not results.tracks:
+                continue
+
+            track = results.tracks[0]
+            player.add(track)
+            queued_titles.add(cand_title)
+            added += 1
+            print(f"[AUTOPLAY] Añadida: {track.title}")
+
+        return added
+
+    @lavalink.listener(lavalink.TrackStartEvent)
+    async def on_track_start(self, event: lavalink.TrackStartEvent) -> None:
+        """Save metadata of the currently playing track for autoplay seeding."""
+        track = event.track
+        if track is None:
+            return
+        self._last_track_info[event.player.guild_id] = {
+            "title": track.title or "",
+            "author": track.author or "",
+            "uri": track.uri or "",
+        }
+
+    @lavalink.listener(lavalink.QueueEndEvent)
+    async def on_queue_end(self, event: lavalink.QueueEndEvent) -> None:
+        """When the queue runs out, auto-fill it if autoplay is enabled for this guild."""
+        guild_id = event.player.guild_id
+
+        if guild_id not in self._autoplay_guilds:
+            print(f"[AUTOPLAY] Cola vacía en guild {guild_id}, autoplay desactivado")
+            return
+
+        print(f"[AUTOPLAY] Cola vacía en guild {guild_id}, rellenando automáticamente…")
+        added = await self._autofill_queue(event.player)
+
+        if added == 0:
+            print("[AUTOPLAY] No se pudieron añadir canciones relacionadas")
+            return
+
+        # Start playback of the newly-added tracks
+        if not event.player.is_playing:
+            await event.player.play()
+            print(f"[AUTOPLAY] Reproducción reanudada con {added} canciones relacionadas")
+
+    @app_commands.command(
+        name="autoplay",
+        description="Activa o desactiva la continuación automática de música",
+    )
+    async def autoplay(self, interaction: discord.Interaction) -> None:
+        """Toggle automatic queue continuation for this guild."""
+        if interaction.guild is None:
+            return await self._send_error(
+                interaction, "Este comando solo funciona en servidores."
+            )
+
+        guild_id = interaction.guild.id
+
+        if guild_id in self._autoplay_guilds:
+            self._autoplay_guilds.discard(guild_id)
+            status = "desactivada"
+            color = BOT_WARNING
+            description = (
+                "La reproducción automática está **desactivada**.\n"
+                "El bot dejará de añadir canciones cuando la cola se vacíe."
+            )
+        else:
+            self._autoplay_guilds.add(guild_id)
+            status = "activada"
+            color = BOT_SUCCESS
+            description = (
+                "La reproducción automática está **activada** ✅\n"
+                "Cuando la cola se vacíe, el bot añadirá canciones relacionadas "
+                "con la última pista reproducida automáticamente."
+            )
+
+        print(f"[AUTOPLAY] guild={guild_id} {status}")
+        await self._send_embed(
+            interaction,
+            self._build_embed(
+                interaction,
+                f"Reproducción automática {status}",
+                description,
+                color=color,
+            ),
+        )
+
     @app_commands.command(
         name="play", description="Reproduce una canción (nombre o URL)"
     )
@@ -1047,6 +1198,28 @@ class MusicCog(commands.Cog):
         except Exception as e:
             print(f"[NOWPLAYING] ✗ Error: {e}")
             await self._send_error(interaction, f"Error: {e}")
+
+    @commands.Cog.listener()
+    async def on_ready(self) -> None:
+        """Register lavalink event hooks once the lavalink client is available."""
+        if self._hooks_registered:
+            return
+        lavalink_client = self._get_lavalink_client()
+        if lavalink_client is None:
+            # Lavalink is initialised in the bot's own on_ready which runs
+            # first; if it's still None here something is wrong – skip and
+            # let the next on_ready attempt register.
+            print("[AUTOPLAY] Lavalink no disponible en on_ready, se reintentará")
+            return
+        lavalink_client.add_event_hooks(self)
+        self._hooks_registered = True
+        print("[AUTOPLAY] Hooks de eventos Lavalink registrados")
+
+    @commands.Cog.listener()
+    async def on_guild_remove(self, guild: discord.Guild) -> None:
+        """Clean up per-guild state when the bot leaves a server."""
+        self._autoplay_guilds.discard(guild.id)
+        self._last_track_info.pop(guild.id, None)
 
 
 async def setup(bot):
