@@ -173,6 +173,7 @@ set +a
 - `/resume` reanuda la reproduccion.
 - `/stop` detiene todo y desconecta el bot.
 - `/nowplaying` muestra la pista actual y su progreso.
+- `/autoplay` activa o desactiva la continuacion automatica de musica. Cuando esta activo, al vaciarse la cola el bot busca y añade canciones relacionadas con la ultima pista reproducida.
 
 ## Problemas comunes
 
